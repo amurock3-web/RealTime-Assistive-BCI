@@ -1,0 +1,190 @@
+import pygame
+import serial
+import joblib
+import numpy as np
+from collections import deque
+import time
+import os
+
+# --- CONFIGURATION ---
+ARDUINO_PORT = 'COM3'  
+BAUD_RATE = 115200
+WINDOW_SIZE = 30       
+VOTE_SIZE = 6          
+CONFIDENCE_THRESHOLD = 0.55  
+
+# --- AI SENSITIVITY ---
+WINK_BOOST = 2.0  
+BLINK_BOOST = 1.8
+CLENCH_BOOST = 1.0 
+
+# --- NEW PHYSICS CONFIGURATION ---
+MAX_SPEED = 1.5      # Decreased forward speed (was 4.0)
+TURN_SPEED = 2.5     # Decreased turning speed (was 5.0)
+
+def extract_live_features(buffer):
+    """EXTRACTS ALL 14 FEATURES"""
+    data = np.array(buffer)
+    ch1, ch2 = data[:, 0], data[:, 1]
+
+    def get_stats(ch):
+        return [
+            np.sqrt(np.mean(ch**2)),        # RMS
+            np.mean(np.abs(np.diff(ch))),   # MAV Diff
+            np.var(ch),                     # Variance
+            np.max(ch) - np.min(ch),        # Peak-to-Peak
+            np.std(ch),                     # Std Dev
+            ((ch[:-1] * ch[1:]) < 0).sum()  # Zero Crossing Rate
+        ]
+
+    f1 = get_stats(ch1)
+    f2 = get_stats(ch2)
+    diff_rms = abs(f1[0] - f2[0])
+    diff_p2p = abs(f1[3] - f2[3])
+
+    return f1 + f2 + [diff_rms, diff_p2p]
+
+def main():
+    print("========================================")
+    print("    BCI WHEELCHAIR: PRECISION PILOT     ")
+    print("========================================\n")
+    
+    pilot = input("Enter Pilot Name: ").strip().lower()
+    
+    try:
+        model = joblib.load(f"{pilot}_model.pkl")
+        scaler = joblib.load(f"{pilot}_scaler.pkl")
+        ser = serial.Serial(ARDUINO_PORT, BAUD_RATE)
+        time.sleep(2)
+        print(f"Brain Loaded for {pilot.upper()}. Simulation Ready.")
+    except Exception as e:
+        print(f"Error: {e}"); return
+
+    pygame.init()
+    WIDTH, HEIGHT = 900, 700
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption(f"BCI Simulation - {pilot.capitalize()}")
+    
+    font_main = pygame.font.SysFont("Arial", 22, bold=True)
+    font_small = pygame.font.SysFont("Arial", 16)
+    
+    # --- STATE VARIABLES ---
+    wc_x, wc_y, wc_angle = WIDTH // 2, HEIGHT // 2 + 50, 0
+    wc_speed = 0
+    is_moving_forward = False  # The new Toggle State
+    previous_cmd = "RELAX"     # Memory for Edge Detection
+    
+    raw_buffer = deque(maxlen=WINDOW_SIZE)
+    vote_buffer = deque(maxlen=VOTE_SIZE)
+    
+    current_probs = {}
+    current_cmd = "RELAX"
+    running, clock = True, pygame.time.Clock()
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: running = False
+
+        # 1. Gather Data
+        while ser.in_waiting > 0:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if "," in line:
+                try:
+                    raw_buffer.append([int(x) for x in line.split(",")])
+                except: pass
+
+        # 2. AI Inference
+        if len(raw_buffer) == WINDOW_SIZE:
+            feat = extract_live_features(raw_buffer)
+            feat_scaled = scaler.transform([feat])
+            
+            base_probs = model.predict_proba(feat_scaled)[0]
+            prob_dict = dict(zip(model.classes_, base_probs))
+            
+            boosted = {
+                'LEFT_WINK': prob_dict.get('LEFT_WINK', 0) * WINK_BOOST,
+                'RIGHT_WINK': prob_dict.get('RIGHT_WINK', 0) * WINK_BOOST,
+                'DOUBLE_BLINK': prob_dict.get('DOUBLE_BLINK', 0) * BLINK_BOOST,
+                'JAW_CLENCH': prob_dict.get('JAW_CLENCH', 0) * CLENCH_BOOST,
+                'RELAX': prob_dict.get('RELAX', 0)
+            }
+            
+            current_probs = boosted 
+            winner = max(boosted, key=boosted.get)
+            
+            if boosted[winner] >= CONFIDENCE_THRESHOLD:
+                vote_buffer.append(winner)
+            else:
+                vote_buffer.append("RELAX")
+
+        # 3. Voting & Toggle Physics
+        if len(vote_buffer) == VOTE_SIZE:
+            final_cmd = max(set(vote_buffer), key=list(vote_buffer).count)
+            current_cmd = final_cmd
+            
+            # --- EDGE DETECTION TOGGLE (JAW CLENCH) ---
+            if "CLENCH" in final_cmd and "CLENCH" not in previous_cmd:
+                is_moving_forward = not is_moving_forward # Flip the switch!
+                
+            # --- EMERGENCY STOP (DOUBLE BLINK) ---
+            if "BLINK" in final_cmd or "SQUEEZE" in final_cmd:
+                is_moving_forward = False
+                
+            # --- TURNING (WINKS) ---
+            # You can steer while moving, or steer while stopped.
+            if "LEFT" in final_cmd: 
+                wc_angle -= TURN_SPEED
+            elif "RIGHT" in final_cmd: 
+                wc_angle += TURN_SPEED
+
+            # Set actual speed based on the toggle state
+            wc_speed = MAX_SPEED if is_moving_forward else 0
+            
+            # Remember this command for the next frame
+            previous_cmd = final_cmd
+
+        # Calculate Movement
+        rad = np.radians(wc_angle)
+        wc_x += wc_speed * np.sin(rad)
+        wc_y -= wc_speed * np.cos(rad)
+        wc_x, wc_y = max(20, min(WIDTH-20, wc_x)), max(20, min(HEIGHT-20, wc_y))
+
+        # 4. Rendering
+        screen.fill((255, 255, 255))
+        
+        # Draw Wheelchair
+        color = (50, 200, 50) if is_moving_forward else (50, 50, 200) # Turns green when driving
+        pygame.draw.circle(screen, color, (int(wc_x), int(wc_y)), 20)
+        indicator_x = wc_x + 30 * np.sin(rad)
+        indicator_y = wc_y - 30 * np.cos(rad)
+        pygame.draw.line(screen, (200, 50, 50), (wc_x, wc_y), (indicator_x, indicator_y), 5)
+        
+        # Draw HUD Monitor
+        pygame.draw.rect(screen, (240, 240, 240), (10, 10, 300, 200), border_radius=10)
+        pygame.draw.rect(screen, (200, 200, 200), (10, 10, 300, 35), border_radius=10)
+        screen.blit(font_main.render("LIVE BRAIN MONITOR", True, (50, 50, 50)), (25, 15))
+        
+        y_offset = 55
+        for cls, p in current_probs.items():
+            bar_color = (0, 150, 0) if cls == current_cmd else (100, 100, 100)
+            pygame.draw.rect(screen, (200, 200, 200), (140, y_offset + 5, 140, 12))
+            pygame.draw.rect(screen, bar_color, (140, y_offset + 5, int(min(140, p * 70)), 12))
+            screen.blit(font_small.render(f"{cls}:", True, (0, 0, 0)), (20, y_offset))
+            y_offset += 25
+
+        # Draw State Dashboard
+        pygame.draw.rect(screen, (50, 50, 50), (WIDTH - 250, 10, 240, 100), border_radius=10)
+        screen.blit(font_main.render(f"CMD: {current_cmd}", True, (255, 255, 255)), (WIDTH - 230, 25))
+        
+        drive_state = "DRIVING" if is_moving_forward else "STOPPED"
+        state_color = (0, 255, 0) if is_moving_forward else (255, 100, 100)
+        screen.blit(font_main.render(f"STATE: {drive_state}", True, state_color), (WIDTH - 230, 60))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    ser.close()
+    pygame.quit()
+
+if __name__ == '__main__':
+    main()
